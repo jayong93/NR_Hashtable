@@ -12,6 +12,7 @@ set(SRC_FILES
 
 add_compile_options(-g -ggdb)
 set(CMAKE_CXX_COMPILER "g++")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
 
 set(CMAKE_CXX_FLAGS_DEBUG "-DDEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG -O3")
