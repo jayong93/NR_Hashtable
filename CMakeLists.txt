@@ -10,7 +10,7 @@ set(SRC_FILES
     NR.cpp
     )
 
-add_compile_options(-g -ggdb)
+add_compile_options(-g -ggdb -std=c++17)
 set(CMAKE_CXX_COMPILER "g++")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
 
