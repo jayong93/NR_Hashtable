@@ -5,6 +5,7 @@
 #include <utility>
 #include <optional>
 #include <cassert>
+#include <numa.h>
 
 using namespace std;
 
@@ -12,9 +13,18 @@ static thread_local unsigned thread_id;
 static constexpr unsigned BACKOFF_DELAY = 500;
 
 template <typename T, typename... Vals>
-T *NUMA_allocation(unsigned numa_id, Vals &&... val)
+T *NUMA_alloc(unsigned numa_id, Vals &&... val)
 {
-    return new T{forward<Vals>(val)...};
+    void *raw_ptr = numa_alloc_onnode(sizeof(T), numa_id);
+    T *ptr = new (raw_ptr) T(forward<Vals>(val)...);
+    return ptr;
+}
+
+template <typename T>
+void NUMA_dealloc(T *ptr)
+{
+    ptr->~T();
+    numa_free(ptr, sizeof(T));
 }
 
 template <typename CMD, typename ARGS>
@@ -35,17 +45,27 @@ public:
     {
         for (auto i = 0; i < node_num; ++i)
         {
-            replicas.emplace_back(NUMA_allocation<T>(i));
-            local_tails.emplace_back(NUMA_allocation<atomic<uint64_t>>(i, (uint64_t)0));
-            combiner_locks.emplace_back(NUMA_allocation<mutex>(i));
-            rw_locks.emplace_back(NUMA_allocation<shared_mutex>(i));
+            replicas.emplace_back(NUMA_alloc<T>(i));
+            local_tails.emplace_back(NUMA_alloc<atomic<uint64_t>>(i, (uint64_t)0));
+            combiner_locks.emplace_back(NUMA_alloc<mutex>(i));
+            rw_locks.emplace_back(NUMA_alloc<shared_mutex>(i));
 
             for (auto j = 0; j < core_num_per_node; ++j)
             {
-                op.emplace_back(NUMA_allocation<optional<pair<CMD, ARGS>>>(i));
-                response.emplace_back(NUMA_allocation<optional<Res>>(i));
+                op.emplace_back(NUMA_alloc<optional<pair<CMD, ARGS>>>(i));
+                response.emplace_back(NUMA_alloc<optional<Res>>(i));
             }
         }
+    }
+    ~NR<T, CMD, ARGS, Res>()
+    {
+        auto dealloc = [](auto &vec) {for(auto ptr: vec) {NUMA_dealloc(ptr);} };
+        dealloc(replicas);
+        dealloc(local_tails);
+        dealloc(combiner_locks);
+        dealloc(rw_locks);
+        dealloc(op);
+        dealloc(response);
     }
 
     Res execute(const CMD &cmd, const ARGS &args)
@@ -64,6 +84,11 @@ public:
     {
         thread_id = id_counter.fetch_add(1, memory_order_relaxed);
         // 각 thread를 id에 맞춰서 NUMA Node에 pinning
+        if (-1 == numa_run_on_node(get_node_id()))
+        {
+            fprintf(stderr, "Can't bind thread #%d to node #%d", thread_id, get_node_id());
+            exit(-1);
+        }
     }
 
     const T &get_latest_replica() const
