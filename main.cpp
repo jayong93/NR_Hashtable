@@ -91,7 +91,7 @@ int main()
 {
     for (uint num_thread = 1; num_thread <= 32; num_thread *= 2)
     {
-        NR_HashTable nr_table{1, num_thread};
+        NR_HashTable nr_table{max((uint)1, num_thread/8), 8};
 
         vector<thread> worker;
         auto start_t = high_resolution_clock::now();
