@@ -36,7 +36,7 @@ public:
         for (auto i = 0; i < node_num; ++i)
         {
             replicas.emplace_back(NUMA_allocation<T>(i));
-            local_tails.emplace_back(NUMA_allocation<atomic<uint64_t>>(i, 0));
+            local_tails.emplace_back(NUMA_allocation<atomic<uint64_t>>(i, (uint64_t)0));
             combiner_locks.emplace_back(NUMA_allocation<mutex>(i));
             rw_locks.emplace_back(NUMA_allocation<shared_mutex>(i));
 
@@ -123,11 +123,11 @@ private:
                 if (old_log_tail <= low_mark && low_mark < target)
                 {
                     update_log_min();
-                    while(log_min.load(memory_order_relaxed) - old_log_min < core_num_per_node)
-                    {
-                        back_off(BACKOFF_DELAY);
-                        update_log_min();
-                    }
+                    // while(log_min.load(memory_order_relaxed) - old_log_min < core_num_per_node)
+                    // {
+                    //     back_off(BACKOFF_DELAY);
+                    //     update_log_min();
+                    // }
                 }
                 // CAS에 성공하면 할당받은 첫번째 entry index를 반환
                 return old_log_tail;
@@ -281,10 +281,10 @@ private:
 
         // 최대한 완료된 곳(completed tail)까지 local tail 및 replica를 갱신한다.
         // 실행이 지연된 Node의 thread가 여기에서 local tail을 갱신해야 log_min을 갱신하는 thread가 진행 가능
-        {
-            auto w_lock = unique_lock<shared_mutex>{rw_lock};
-            update_replica(replica, node_id, completed_tail.load(memory_order_acquire), w_lock);
-        }
+        // {
+        //     auto w_lock = unique_lock<shared_mutex>{rw_lock};
+        //     update_replica(replica, node_id, completed_tail.load(memory_order_acquire), w_lock);
+        // }
         // combiner lock 얻기를 시도한다.
         unique_lock<mutex> lock{combiner_lock, try_to_lock};
         while (true)
