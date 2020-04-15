@@ -1,7 +1,7 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.17)
 
 project("NR_Hashtable")
-set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_VERBOSE_MAKEFILE true)
 
 set(OUTPUT_NAME "${CMAKE_PROJECT_NAME}")
