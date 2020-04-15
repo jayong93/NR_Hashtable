@@ -122,6 +122,24 @@ public:
 
     Res execute_read_only(const CMD &cmd, const ARGS &args)
     {
+        auto read_tail = completed_tail.load(memory_order_relaxed);
+        auto node_id = get_node_id();
+        auto& rw_lock = *rw_locks[node_id];
+
+        while(true) {
+            unique_lock<shared_mutex> lock{rw_lock, try_to_lock};
+            if(lock)
+            {
+                update_replica(node_id, read_tail);
+            }
+            else
+            {
+                back_off(BACKOFF_DELAY);
+            }
+        }
+
+        shared_lock<shared_mutex> lock{rw_lock};
+        return replicas[node_id]->execute(cmd, args);
     }
 
     Res combine(const CMD &cmd, const ARGS &args)
@@ -135,7 +153,7 @@ public:
         *op[thread_id] = make_pair<CMD, ARGS>(cmd, args);
 
         // combiner lock 얻기를 시도한다.
-        unique_lock<mutex> lock = unique_lock<mutex>{combiner_lock, try_to_lock_t};
+        unique_lock<mutex> lock{combiner_lock, try_to_lock};
         while (true)
         {
             // lock을 얻는데에 성공했으면
@@ -146,7 +164,7 @@ public:
                 // log entry를 등록된 op들 수 만큼 할당 받고 op들을 등록한다.
                 auto start_index = update_log(batch);
                 // writer lock을 얻고 node replica를 start entry까지 update 한 뒤 local tail을 update 한다.
-                auto w_lock = unique_lock<mutex>{rw_lock};
+                auto w_lock = unique_lock<shared_mutex>{rw_lock};
                 update_replica(node_id, start_index);
                 // completed tail이 할당받은 마지막 entry index가 되도록 CAS를 시도한다.
                 update_completed_tail((start_index + batch.size()) % log.size());
@@ -159,7 +177,7 @@ public:
             else
             {
                 // 자신의 response가 갱신이 되거나 combiner lock이 해제될 때까지 대기한다.
-                while (!res && !(lock = unique_lock<mutex>{combiner_lock, try_to_lock_t}))
+                while (!res && !(lock = unique_lock<mutex>{combiner_lock, try_to_lock}))
                 {
                     back_off(BACKOFF_DELAY);
                 }
@@ -180,7 +198,7 @@ public:
             auto &o = *op[i];
             if (o)
             {
-                ids.emplace_back(i, o->first, o->second);
+                batch.emplace_back(i, o->first, o->second);
             }
         }
         return batch;
