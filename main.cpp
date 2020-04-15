@@ -52,16 +52,18 @@ struct HashTable
             return map.erase(args.first);
         case CMD::Contains:
             return map.find(args.first) != map.end();
+        default:
+            return -1;
         }
     }
 };
 
-constexpr unsigned NUM_TEST = 400'000;
+constexpr unsigned NUM_TEST = 4'000'000;
 constexpr unsigned RANGE = 1'000;
 
 using NR_HashTable = NR<HashTable, HashTable::CMD, HashTable::ARGS, HashTable::Res>;
 
-void benchmark(int num_thread, NR_HashTable *table)
+void benchmark(uint num_thread, NR_HashTable *table)
 {
     table->init_per_thread();
     for (int i = 0; i < NUM_TEST / num_thread; ++i)
@@ -87,13 +89,13 @@ void benchmark(int num_thread, NR_HashTable *table)
 
 int main()
 {
-    for (auto num_thread = 1; num_thread < 32; num_thread *= 2)
+    for (uint num_thread = 1; num_thread < 32; num_thread *= 2)
     {
         NR_HashTable nr_table{1, num_thread};
 
         vector<thread> worker;
         auto start_t = high_resolution_clock::now();
-        for (int i = 0; i < num_thread; ++i)
+        for (uint i = 0; i < num_thread; ++i)
             worker.emplace_back(benchmark, num_thread, &nr_table);
         for (auto &th : worker)
             th.join();
@@ -109,5 +111,6 @@ int main()
         printf("\n");
 
         printf("%d Threads, Time=%lld ms\n", num_thread, duration_cast<milliseconds>(du).count());
+        fflush(NULL);
     }
 }
