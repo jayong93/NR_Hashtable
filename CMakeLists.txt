@@ -11,6 +11,7 @@ set(SRC_FILES
     )
 
 add_compile_options(-g -ggdb -std=c++17)
+link_libraries(pthread tcmalloc)
 set(CMAKE_CXX_COMPILER "g++")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
 

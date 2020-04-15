@@ -10,10 +10,10 @@ using namespace std;
 static thread_local unsigned thread_id;
 static constexpr unsigned BACKOFF_DELAY = 500;
 
-template <typename T>
-T *NUMA_allocation(unsigned numa_id)
+template <typename T, typename... Vals>
+T *NUMA_allocation(unsigned numa_id, Vals&&... val)
 {
-    return new T;
+    return new T{forward<Vals>(val)...};
 }
 
 template <typename CMD, typename ARGS>
@@ -21,7 +21,7 @@ struct LogEntry
 {
     CMD command;
     ARGS args;
-    bool is_empty = true;
+    volatile bool is_empty = true;
 };
 
 template <typename T, typename CMD, typename ARGS, typename Res>
@@ -32,14 +32,12 @@ class NR
 public:
     NR<T, CMD, ARGS, Res>(unsigned node_num, unsigned core_num_per_node) : node_num{node_num}, core_num_per_node{core_num_per_node}, log{node_num * core_num_per_node * 10}, log_min{node_num * core_num_per_node * 10 - 1}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
     {
-        replicas.reserve(node_num);
-        local_tails.reserve(node_num);
-        combiner_locks.reserve(node_num);
         for (auto i = 0; i < node_num; ++i)
         {
             replicas.emplace_back(NUMA_allocation<T>(i));
-            local_tails.emplace_back(NUMA_allocation<atomic<unsigned int>>(i));
+            local_tails.emplace_back(NUMA_allocation<atomic<unsigned int>>(i, 0));
             combiner_locks.emplace_back(NUMA_allocation<mutex>(i));
+            rw_locks.emplace_back(NUMA_allocation<shared_mutex>(i));
 
             for (auto j = 0; j < core_num_per_node; ++j)
             {
@@ -49,6 +47,61 @@ public:
         }
     }
 
+    Res execute(const CMD &cmd, const ARGS &args)
+    {
+        if (T::is_read_only(cmd))
+        {
+            return execute_read_only(cmd, args);
+        }
+        else
+        {
+            return combine(cmd, args);
+        }
+    }
+
+    void init_per_thread()
+    {
+        thread_id = id_counter.fetch_add(1, memory_order_relaxed);
+        // 각 thread를 id에 맞춰서 NUMA Node에 pinning
+    }
+
+    const T &get_latest_replica() const
+    {
+        auto [is_wraped, _] = is_wraped_around();
+        unsigned max_tail = 0;
+        unsigned max_node = 0;
+        for (auto i = 0; i < node_num; ++i)
+        {
+            auto real_node_tail = get_real_index(is_wraped, local_tails[i]->load());
+            if (max_tail < real_node_tail)
+            {
+                max_tail = real_node_tail;
+                max_node = i;
+            }
+        }
+        return *replicas[max_node];
+    }
+
+private:
+    vector<LogEntry<CMD, ARGS>> log;
+    atomic<unsigned int> log_tail;
+    atomic<unsigned int> completed_tail;
+    atomic<unsigned int> log_min;
+    const unsigned int max_batch;
+    const unsigned int node_num;
+    const unsigned int core_num_per_node;
+    atomic_uint id_counter{0};
+
+    // Node local data
+    vector<T *> replicas;
+    vector<atomic<unsigned int> *> local_tails;
+    vector<mutex *> combiner_locks;
+    vector<shared_mutex *> rw_locks;
+
+    // Thread local data
+    vector<optional<pair<CMD, ARGS>> *> op;
+    vector<optional<Res> *> response;
+
     unsigned int reserve_log(unsigned int size)
     {
         // CAS에서 실패한 경우 old_log_tail이 갱신되므로 여기서만 load하면 충분
@@ -56,12 +109,17 @@ public:
         while (true)
         {
             // 만약 log_tail + size가 log_min 보다 크면 log_min을 다른 thread가 옮겨줄 때까지 대기
-            auto target = (old_log_tail + size) % log.size();
-            while (log_min.load(memory_order_relaxed) < old_log_tail + size)
+            while (true)
             {
+                auto [is_wraped, local_min] = is_wraped_around();
+                local_min = get_real_index(is_wraped, local_min);
+                if (old_log_tail + size <= local_min)
+                    break;
+
                 back_off(BACKOFF_DELAY);
             }
             // size만큼 tail을 CAS로 전진, 만약 wrap around가 발생하면 계산해서 정확한 위치를 목표로 CAS
+            auto target = (old_log_tail + size) % log.size();
             if (true == log_tail.compare_exchange_strong(old_log_tail, target))
             {
                 // 만약 내가 log_min을 update 해야 한다면 update
@@ -70,7 +128,7 @@ public:
                 {
                     low_mark = log.size() - low_mark;
                 }
-                auto is_wraped = is_wraped_around();
+                auto [is_wraped, _] = is_wraped_around();
                 low_mark = get_real_index(is_wraped, low_mark);
                 auto real_start = get_real_index(is_wraped, old_log_tail);
                 auto real_target = get_real_index(is_wraped, target);
@@ -87,7 +145,7 @@ public:
 
     void update_log_min()
     {
-        bool is_wraped = is_wraped_around();
+        auto [is_wraped, _] = is_wraped_around();
 
         unsigned min_tail = log.size() * 2;
 
@@ -106,87 +164,8 @@ public:
     // delay 만큼 대기
     void back_off(unsigned int delay) const
     {
-    }
-
-    Res execute(const CMD &cmd, const ARGS &args)
-    {
-        if (T::is_read_only(cmd))
+        for (volatile unsigned long long i = 0; i < delay; ++i)
         {
-            return execute_read_only(cmd, args, thread_id);
-        }
-        else
-        {
-            return combine(cmd, args, thread_id);
-        }
-    }
-
-    Res execute_read_only(const CMD &cmd, const ARGS &args)
-    {
-        auto read_tail = completed_tail.load(memory_order_relaxed);
-        auto node_id = get_node_id();
-        auto& rw_lock = *rw_locks[node_id];
-
-        while(true) {
-            unique_lock<shared_mutex> lock{rw_lock, try_to_lock};
-            if(lock)
-            {
-                update_replica(node_id, read_tail);
-            }
-            else
-            {
-                back_off(BACKOFF_DELAY);
-            }
-        }
-
-        shared_lock<shared_mutex> lock{rw_lock};
-        return replicas[node_id]->execute(cmd, args);
-    }
-
-    Res combine(const CMD &cmd, const ARGS &args)
-    {
-        auto node_id = get_node_id();
-        auto &combiner_lock = *combiner_locks[node_id];
-        auto &rw_lock = *rw_locks[node_id];
-        auto &res = *response[thread_id];
-
-        res.reset();
-        *op[thread_id] = make_pair<CMD, ARGS>(cmd, args);
-
-        // combiner lock 얻기를 시도한다.
-        unique_lock<mutex> lock{combiner_lock, try_to_lock};
-        while (true)
-        {
-            // lock을 얻는데에 성공했으면
-            if (lock)
-            {
-                // 각 thread의 local op 중 등록된 것들을 모은다
-                auto batch = collect_batch();
-                // log entry를 등록된 op들 수 만큼 할당 받고 op들을 등록한다.
-                auto start_index = update_log(batch);
-                // writer lock을 얻고 node replica를 start entry까지 update 한 뒤 local tail을 update 한다.
-                auto w_lock = unique_lock<shared_mutex>{rw_lock};
-                update_replica(node_id, start_index);
-                // completed tail이 할당받은 마지막 entry index가 되도록 CAS를 시도한다.
-                update_completed_tail((start_index + batch.size()) % log.size());
-                // response에 결과들을 등록 한다.
-                write_responses(batch, node_id);
-
-                return *res;
-            }
-            // 실패한 경우
-            else
-            {
-                // 자신의 response가 갱신이 되거나 combiner lock이 해제될 때까지 대기한다.
-                while (!res && !(lock = unique_lock<mutex>{combiner_lock, try_to_lock}))
-                {
-                    back_off(BACKOFF_DELAY);
-                }
-                // response가 갱신됐다면 그 결과를 반환한다.
-                if (res)
-                {
-                    return *res;
-                }
-            }
         }
     }
 
@@ -218,9 +197,8 @@ public:
         return start_idx;
     }
 
-    void update_replica(unsigned node_id, unsigned start_index)
+    void update_replica(T &replica, unsigned node_id, unsigned start_index)
     {
-        auto &replica = *replicas[node_id];
         auto &local_tail = *local_tails[node_id];
 
         // 이 함수를 호출하기 전에 writer lock을 걸기 때문에 local tail과 replica를 마음껏 수정해도 된다.
@@ -233,7 +211,7 @@ public:
             }
             replica.execute(log[l_tail].command, log[l_tail].args);
 
-            l_tail = (l_tail + 1) % log.size();
+            l_tail = ((l_tail + 1) % log.size());
             local_tail.store(l_tail, memory_order_release);
         }
     }
@@ -246,7 +224,7 @@ public:
             if (completed_tail.compare_exchange_strong(local_c_tail, last_index))
                 break;
 
-            bool is_wraped = is_wraped_around();
+            auto [is_wraped, _] = is_wraped_around();
             unsigned real_c_tail = get_real_index(is_wraped, local_c_tail);
             unsigned real_last_index = get_real_index(is_wraped, last_index);
             if (real_last_index < real_c_tail)
@@ -254,17 +232,18 @@ public:
         }
     }
 
-    void write_response(const Batch& batch, T& replica)
+    void write_responses(const Batch &batch, T &replica)
     {
-        for(auto& [id, cmd, args] : batch)
+        for (auto &[id, cmd, args] : batch)
         {
             *response[id] = replica.execute(cmd, args);
         }
     }
 
-    bool is_wraped_around() const
+    pair<bool, unsigned> is_wraped_around() const
     {
-        return log_min.load(memory_order_relaxed) != (log.size() - 1);
+        auto local_min = log_min.load(memory_order_relaxed);
+        return make_pair(local_min != (log.size() - 1), local_min);
     }
 
     unsigned int get_node_id() const
@@ -274,38 +253,86 @@ public:
 
     // log_min의 위치에 따라서 확장된 index를 반환
     // log_min이 log.size() - 1이 아니라면 log_min보다 작거나 같은 index가 사실은 log_min보다 큰 index보다 더 크다.
-    unsigned get_real_index(bool is_wraped, unsigned index)
+    unsigned get_real_index(bool is_wraped, unsigned index) const
     {
-        if (index <= log_min.load(memory_order_relaxed))
+        if (is_wraped && index <= log_min.load(memory_order_relaxed))
         {
             return index + log.size();
         }
         return index;
     }
 
-    void init_per_thread()
+    Res execute_read_only(const CMD &cmd, const ARGS &args)
     {
-        thread_id = id_counter.fetch_add(1, memory_order_relaxed);
-        // 각 thread를 id에 맞춰서 NUMA Node에 pinning
+        auto read_tail = completed_tail.load(memory_order_relaxed);
+        auto node_id = get_node_id();
+        auto &rw_lock = *rw_locks[node_id];
+        auto &local_tail = *local_tails[node_id];
+        auto &replica = *replicas[node_id];
+
+        while (local_tail.load(memory_order_acquire) < read_tail)
+        {
+            unique_lock<shared_mutex> lock{rw_lock, try_to_lock};
+            if (lock)
+            {
+                update_replica(replica, node_id, read_tail);
+            }
+            else
+            {
+                back_off(BACKOFF_DELAY);
+            }
+        }
+
+        shared_lock<shared_mutex> lock{rw_lock};
+        return replica.execute(cmd, args);
     }
 
-private:
-    vector<LogEntry<CMD, ARGS>> log;
-    atomic<unsigned int> log_tail;
-    atomic<unsigned int> completed_tail;
-    atomic<unsigned int> log_min;
-    const unsigned int max_batch;
-    const unsigned int node_num;
-    const unsigned int core_num_per_node;
-    atomic_uint id_counter{0};
+    Res combine(const CMD &cmd, const ARGS &args)
+    {
+        auto node_id = get_node_id();
+        auto &combiner_lock = *combiner_locks[node_id];
+        auto &rw_lock = *rw_locks[node_id];
+        auto &res = *response[thread_id];
 
-    // Node local data
-    vector<T *> replicas;
-    vector<atomic<unsigned int> *> local_tails;
-    vector<mutex *> combiner_locks;
-    vector<shared_mutex *> rw_locks;
+        res.reset();
+        op[thread_id]->emplace(cmd, args);
 
-    // Thread local data
-    vector<optional<pair<CMD, ARGS>> *> op;
-    vector<optional<Res> *> response;
+        // combiner lock 얻기를 시도한다.
+        unique_lock<mutex> lock{combiner_lock, try_to_lock};
+        while (true)
+        {
+            // lock을 얻는데에 성공했으면
+            if (lock)
+            {
+                // 각 thread의 local op 중 등록된 것들을 모은다
+                auto batch = collect_batch();
+                // log entry를 등록된 op들 수 만큼 할당 받고 op들을 등록한다.
+                auto start_index = update_log(batch);
+                // writer lock을 얻고 node replica를 start entry까지 update 한 뒤 local tail을 update 한다.
+                auto w_lock = unique_lock<shared_mutex>{rw_lock};
+                auto &replica = *replicas[node_id];
+                update_replica(replica, node_id, start_index);
+                // completed tail이 할당받은 마지막 entry index가 되도록 CAS를 시도한다.
+                update_completed_tail((start_index + batch.size()) % log.size());
+                // response에 결과들을 등록 한다.
+                write_responses(batch, replica);
+
+                return *res;
+            }
+            // 실패한 경우
+            else
+            {
+                // 자신의 response가 갱신이 되거나 combiner lock이 해제될 때까지 대기한다.
+                while (!res && !(lock = unique_lock<mutex>{combiner_lock, try_to_lock}))
+                {
+                    back_off(BACKOFF_DELAY);
+                }
+                // response가 갱신됐다면 그 결과를 반환한다.
+                if (res)
+                {
+                    return *res;
+                }
+            }
+        }
+    }
 };
