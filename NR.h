@@ -41,7 +41,7 @@ class NR
     using Batch = vector<tuple<unsigned, CMD, ARGS>>;
 
 public:
-    NR<T, CMD, ARGS, Res>(unsigned node_num, unsigned core_num_per_node) : node_num{node_num}, core_num_per_node{core_num_per_node}, log{node_num * core_num_per_node * 10}, log_min{node_num * core_num_per_node * 10}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
+    NR<T, CMD, ARGS, Res>(unsigned node_num, unsigned core_num_per_node) : node_num{node_num}, core_num_per_node{core_num_per_node}, log{node_num * core_num_per_node * 100}, log_min{node_num * core_num_per_node * 100}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
     {
         for (auto i = 0; i < node_num; ++i)
         {

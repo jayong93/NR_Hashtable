@@ -89,7 +89,7 @@ void benchmark(uint num_thread, NR_HashTable *table)
 
 int main()
 {
-    for (uint num_thread = 1; num_thread < 32; num_thread *= 2)
+    for (uint num_thread = 1; num_thread <= 32; num_thread *= 2)
     {
         NR_HashTable nr_table{1, num_thread};
 
