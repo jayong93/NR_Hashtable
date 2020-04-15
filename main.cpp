@@ -56,7 +56,7 @@ struct HashTable
     }
 };
 
-constexpr unsigned NUM_TEST = 4'000'000;
+constexpr unsigned NUM_TEST = 400'000;
 constexpr unsigned RANGE = 1'000;
 
 using NR_HashTable = NR<HashTable, HashTable::CMD, HashTable::ARGS, HashTable::Res>;
