@@ -128,31 +128,9 @@ private:
     vector<optional<pair<CMD, ARGS>> *> op;
     vector<optional<Res> *> response;
 
-    void check_and_update_log_min(uint64_t target)
+    uint64_t get_low_mark()
     {
-        if (log_min.load(memory_order_relaxed) < target)
-        {
-            // 누군가가 ticket을 뽑고 update를 시도하고 있다면 대기
-            if (min_updater_ticket.load(memory_order_acquire) != 0)
-            {
-                while (min_updater_ticket.load(memory_order_acquire) != 0)
-                    back_off(BACKOFF_DELAY);
-            }
-            // ticket이 0이어도 내가 티켓을 확인한 뒤 누군가가 update를 하지 않았다면 내가 시도
-            else if (log_min.load(memory_order_relaxed) < target)
-            {
-                if (0 == min_updater_ticket.fetch_add(1, memory_order_relaxed))
-                {
-                    update_log_min();
-                    min_updater_ticket.store(0, memory_order_release);
-                }
-                else
-                {
-                    while (min_updater_ticket.load(memory_order_acquire) != 0)
-                        back_off(BACKOFF_DELAY);
-                }
-            }
-        }
+        return log_min.load(memory_order_acquire) - core_num_per_node;
     }
 
     unsigned int reserve_log(unsigned int size)
@@ -161,8 +139,6 @@ private:
         auto old_log_tail = log_tail.load(memory_order_relaxed);
         while (true)
         {
-            // end_entry가 log_min보다 크면 다른 thread가 log_min을 업데이트 하기를 기다림
-            check_and_update_log_min(old_log_tail + size);
             // size만큼 tail을 CAS로 전진, 만약 wrap around가 발생하면 계산해서 정확한 위치를 목표로 CAS
             auto target = old_log_tail + size;
             if (true == log_tail.compare_exchange_strong(old_log_tail, target))
@@ -221,26 +197,44 @@ private:
         return batch;
     }
 
-    unsigned int update_log(const Batch &batch)
+    unsigned int update_log(const Batch &batch, T &replica, const unique_lock<shared_mutex> &lg)
     {
         const auto start_idx = reserve_log(batch.size());
+
+        auto node_id = get_node_id();
+        update_replica(replica, node_id, start_idx, lg);
+
         for (auto i = 0; i < batch.size(); ++i)
         {
+            // 내가 log_min 갱신 담당이라면 update
+            if (start_idx + i == get_low_mark())
+            {
+                update_log_min();
+            }
+            // log_min 갱신이 필요하다면 담당 thread가 update하기를 대기
+            while (start_idx >= log_min.load(memory_order_acquire)
+            {
+                back_off(BACKOFF_DELAY);
+            }
+
             const auto &[_, cmd, args] = batch[i];
             auto &entry = log[(start_idx + i) % log.size()];
             entry.command = cmd;
             entry.args = args;
             entry.is_empty = false;
         }
+
+        // local tail을 업데이트 한다.
+        local_tails[node_id]->store(start_idx + batch.size(), memory_order_release);
         return start_idx;
     }
 
     void update_replica(T &replica, unsigned node_id, uint64_t to, const unique_lock<shared_mutex> &lg)
     {
+        // 이 함수를 호출하기 전에 writer lock을 걸기 때문에 local tail과 replica를 마음껏 수정해도 된다.
         assert(lg && "the writer lock has not been acquired");
         auto &local_tail = *local_tails[node_id];
 
-        // 이 함수를 호출하기 전에 writer lock을 걸기 때문에 local tail과 replica를 마음껏 수정해도 된다.
         unsigned l_tail = local_tail.load(memory_order_relaxed);
         while (l_tail < to)
         {
@@ -333,13 +327,9 @@ private:
             {
                 // 각 thread의 local op 중 등록된 것들을 모은다
                 auto batch = collect_batch();
-                // log entry를 등록된 op들 수 만큼 할당 받고 op들을 등록한다.
-                auto start_index = update_log(batch);
-                // writer lock을 얻고 node replica를 start entry까지 update 한 뒤 local tail을 update 한다.
+                // log entry를 등록된 op들 수 만큼 할당 받고 op들을 등록한다. 그리고 local replica를 update해서 local tail을 옮긴다
                 auto w_lock = unique_lock<shared_mutex>{rw_lock};
-                update_replica(replica, node_id, start_index, w_lock);
-                // local tail을 업데이트 한다.
-                local_tails[node_id]->store(start_index + batch.size(), memory_order_release);
+                auto start_index = update_log(batch, replica, w_lock);
                 // completed tail이 할당받은 마지막 entry index가 되도록 CAS를 시도한다.
                 update_completed_tail((start_index + batch.size()) % log.size());
                 // response에 결과들을 등록 한다.
