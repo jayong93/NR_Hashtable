@@ -35,13 +35,14 @@ struct LogEntry
     volatile bool is_empty = true;
 };
 
+constexpr unsigned LOG_MULTIPIER = 5;
 template <typename T, typename CMD, typename ARGS, typename Res>
 class NR
 {
     using Batch = vector<tuple<unsigned, CMD, ARGS>>;
 
 public:
-    NR<T, CMD, ARGS, Res>(unsigned node_num, unsigned core_num_per_node) : node_num{node_num}, core_num_per_node{core_num_per_node}, log{node_num * core_num_per_node * 100}, log_min{node_num * core_num_per_node * 100}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
+    NR<T, CMD, ARGS, Res>(unsigned node_num, unsigned core_num_per_node) : node_num{node_num}, core_num_per_node{core_num_per_node}, log{node_num * core_num_per_node * LOG_MULTIPIER}, log_min{node_num * core_num_per_node * LOG_MULTIPIER}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
     {
         for (auto i = 0; i < node_num; ++i)
         {
@@ -151,27 +152,34 @@ private:
 
     void update_log_min()
     {
-        auto min_tail = UINT64_MAX;
-        auto local_log_min = log_min.load(memory_order_relaxed);
-
-        for (auto local_tail_ptr : local_tails)
+        while (true)
         {
-            auto local_tail = local_tail_ptr->load(memory_order_acquire);
-            if (local_tail < min_tail)
+            auto min_tail = UINT64_MAX;
+            auto local_log_min = log_min.load(memory_order_relaxed);
+
+            for (auto local_tail_ptr : local_tails)
             {
-                min_tail = local_tail;
+                auto local_tail = local_tail_ptr->load(memory_order_acquire);
+                if (local_tail < min_tail)
+                {
+                    min_tail = local_tail;
+                }
             }
-        }
-        auto distance = log.size() - (local_log_min % log.size()) + (min_tail % log.size());
-        min_tail = local_log_min + distance;
 
-        while (local_log_min < min_tail)
-        {
-            log[local_log_min % log.size()].is_empty = true;
-            ++local_log_min;
-        }
+            if (local_log_min % log.size() == min_tail % log.size())
+                continue;
 
-        log_min.store(min_tail, memory_order_release);
+            min_tail += log.size();
+
+            while (local_log_min < min_tail)
+            {
+                log[local_log_min % log.size()].is_empty = true;
+                ++local_log_min;
+            }
+
+            log_min.store(min_tail, memory_order_release);
+            return;
+        }
     }
 
     // delay 만큼 대기
@@ -202,17 +210,12 @@ private:
         const auto start_idx = reserve_log(batch.size());
 
         auto node_id = get_node_id();
-        update_replica(replica, node_id, start_idx, lg);
+        update_replica(replica, node_id, completed_tail.load(memory_order_acquire), lg);
 
         for (auto i = 0; i < batch.size(); ++i)
         {
-            // 내가 log_min 갱신 담당이라면 update
-            if (start_idx + i == get_low_mark())
-            {
-                update_log_min();
-            }
             // log_min 갱신이 필요하다면 담당 thread가 update하기를 대기
-            while (start_idx >= log_min.load(memory_order_acquire)
+            while (start_idx + i >= log_min.load(memory_order_acquire))
             {
                 back_off(BACKOFF_DELAY);
             }
@@ -222,6 +225,12 @@ private:
             entry.command = cmd;
             entry.args = args;
             entry.is_empty = false;
+
+            // 내가 log_min 갱신 담당이라면 update
+            if (start_idx + i == get_low_mark())
+            {
+                update_log_min();
+            }
         }
 
         // local tail을 업데이트 한다.
@@ -331,7 +340,7 @@ private:
                 auto w_lock = unique_lock<shared_mutex>{rw_lock};
                 auto start_index = update_log(batch, replica, w_lock);
                 // completed tail이 할당받은 마지막 entry index가 되도록 CAS를 시도한다.
-                update_completed_tail((start_index + batch.size()) % log.size());
+                update_completed_tail(start_index + batch.size());
                 // response에 결과들을 등록 한다.
                 write_responses(batch, replica);
 
