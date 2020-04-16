@@ -116,6 +116,7 @@ private:
     const uint64_t node_num;
     const uint64_t core_num_per_node;
     atomic_uint id_counter{0};
+    atomic_uint min_updater_ticket{0};
 
     // Node local data
     vector<T *> replicas;
@@ -127,33 +128,45 @@ private:
     vector<optional<pair<CMD, ARGS>> *> op;
     vector<optional<Res> *> response;
 
+    void check_and_update_log_min(uint64_t target)
+    {
+        if (log_min.load(memory_order_relaxed) < target)
+        {
+            // 누군가가 ticket을 뽑고 update를 시도하고 있다면 대기
+            if (min_updater_ticket.load(memory_order_acquire) != 0)
+            {
+                while (min_updater_ticket.load(memory_order_acquire) != 0)
+                    back_off(BACKOFF_DELAY);
+            }
+            // ticket이 0이어도 내가 티켓을 확인한 뒤 누군가가 update를 하지 않았다면 내가 시도
+            else if (log_min.load(memory_order_relaxed) < target)
+            {
+                if (0 == min_updater_ticket.fetch_add(1, memory_order_relaxed))
+                {
+                    update_log_min();
+                    min_updater_ticket.store(0, memory_order_release);
+                }
+                else
+                {
+                    while (min_updater_ticket.load(memory_order_acquire) != 0)
+                        back_off(BACKOFF_DELAY);
+                }
+            }
+        }
+    }
+
     unsigned int reserve_log(unsigned int size)
     {
         // CAS에서 실패한 경우 old_log_tail이 갱신되므로 여기서만 load하면 충분
         auto old_log_tail = log_tail.load(memory_order_relaxed);
         while (true)
         {
-            // end_entry가 log_min보다 크거나 같으면 다른 thread가 log_min을 업데이트 하기를 기다림
-            while (log_min.load(memory_order_relaxed) < old_log_tail + size)
-            {
-                back_off(BACKOFF_DELAY);
-            }
+            // end_entry가 log_min보다 크면 다른 thread가 log_min을 업데이트 하기를 기다림
+            check_and_update_log_min(old_log_tail + size);
             // size만큼 tail을 CAS로 전진, 만약 wrap around가 발생하면 계산해서 정확한 위치를 목표로 CAS
             auto target = old_log_tail + size;
             if (true == log_tail.compare_exchange_strong(old_log_tail, target))
             {
-                // low mark에 해당하는 entry를 가졌다면 log min을 갱신
-                auto old_log_min = log_min.load(memory_order_relaxed);
-                auto low_mark = old_log_min - core_num_per_node;
-                if (old_log_tail <= low_mark && low_mark < target)
-                {
-                    update_log_min();
-                    // while(log_min.load(memory_order_relaxed) - old_log_min < core_num_per_node)
-                    // {
-                    //     back_off(BACKOFF_DELAY);
-                    //     update_log_min();
-                    // }
-                }
                 // CAS에 성공하면 할당받은 첫번째 entry index를 반환
                 return old_log_tail;
             }
@@ -163,6 +176,7 @@ private:
     void update_log_min()
     {
         auto min_tail = UINT64_MAX;
+        auto local_log_min = log_min.load(memory_order_relaxed);
 
         for (auto local_tail_ptr : local_tails)
         {
@@ -172,9 +186,9 @@ private:
                 min_tail = local_tail;
             }
         }
-        min_tail += log.size();
+        auto distance = log.size() - (local_log_min % log.size()) + (min_tail % log.size());
+        min_tail = local_log_min + distance;
 
-        auto local_log_min = log_min.load(memory_order_relaxed) + 1;
         while (local_log_min < min_tail)
         {
             log[local_log_min % log.size()].is_empty = true;
@@ -221,14 +235,14 @@ private:
         return start_idx;
     }
 
-    void update_replica(T &replica, unsigned node_id, uint64_t start_index, const unique_lock<shared_mutex> &lg)
+    void update_replica(T &replica, unsigned node_id, uint64_t to, const unique_lock<shared_mutex> &lg)
     {
         assert(lg && "the writer lock has not been acquired");
         auto &local_tail = *local_tails[node_id];
 
         // 이 함수를 호출하기 전에 writer lock을 걸기 때문에 local tail과 replica를 마음껏 수정해도 된다.
         unsigned l_tail = local_tail.load(memory_order_relaxed);
-        while (l_tail < start_index)
+        while (l_tail < to)
         {
             const auto idx = l_tail % log.size();
             while (log[idx].is_empty)

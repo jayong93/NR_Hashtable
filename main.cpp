@@ -84,14 +84,18 @@ void benchmark(uint num_thread, NR_HashTable *table)
             printf("Unknown Command!\n");
             exit(-1);
         }
+#ifndef NDEBUG
+        if (i % 500 == 0)
+            printf("Thread #%d run operation #%d\n", thread_id, i);
+#endif
     }
 }
 
 int main()
 {
-    for (uint num_thread = 1; num_thread <= 32; num_thread *= 2)
+    for (uint num_thread = 16; num_thread <= 32; num_thread *= 2)
     {
-        NR_HashTable nr_table{max((uint)1, num_thread/8), min(num_thread, (uint)8)};
+        NR_HashTable nr_table{max((uint)1, num_thread / 8), min(num_thread, (uint)8)};
 
         vector<thread> worker;
         auto start_t = high_resolution_clock::now();
