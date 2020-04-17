@@ -35,14 +35,14 @@ struct LogEntry
     volatile bool is_empty = true;
 };
 
-constexpr unsigned LOG_MULTIPIER = 5;
+constexpr unsigned LOG_SIZE = 1'000'000;
 template <typename T, typename CMD, typename ARGS, typename Res>
 class NR
 {
     using Batch = vector<tuple<unsigned, CMD, ARGS>>;
 
 public:
-    NR<T, CMD, ARGS, Res>(unsigned node_num, unsigned core_num_per_node) : node_num{node_num}, core_num_per_node{core_num_per_node}, log{node_num * core_num_per_node * LOG_MULTIPIER}, log_min{node_num * core_num_per_node * LOG_MULTIPIER}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
+    NR<T, CMD, ARGS, Res>(unsigned node_num, unsigned core_num_per_node) : node_num{node_num}, core_num_per_node{core_num_per_node}, log{LOG_SIZE}, log_min{LOG_SIZE}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
     {
         for (auto i = 0; i < node_num; ++i)
         {
@@ -131,13 +131,13 @@ private:
 
     uint64_t get_low_mark()
     {
-        return log_min.load(memory_order_seq_cst) - core_num_per_node;
+        return log_min.load(memory_order_relaxed) - core_num_per_node;
     }
 
     unsigned int reserve_log(unsigned int size)
     {
         // CAS에서 실패한 경우 old_log_tail이 갱신되므로 여기서만 load하면 충분
-        auto old_log_tail = log_tail.load(memory_order_seq_cst);
+        auto old_log_tail = log_tail.load(memory_order_relaxed);
         while (true)
         {
             // size만큼 tail을 CAS로 전진, 만약 wrap around가 발생하면 계산해서 정확한 위치를 목표로 CAS
@@ -153,11 +153,11 @@ private:
     void update_log_min()
     {
         auto min_tail = UINT64_MAX;
-        auto local_log_min = log_min.load(memory_order_seq_cst);
+        auto local_log_min = log_min.load(memory_order_acquire);
 
         for (auto local_tail_ptr : local_tails)
         {
-            auto local_tail = local_tail_ptr->load(memory_order_seq_cst);
+            auto local_tail = local_tail_ptr->load(memory_order_acquire);
             if (local_tail < min_tail)
             {
                 min_tail = local_tail;
@@ -172,7 +172,7 @@ private:
             ++local_log_min;
         }
 
-        log_min.store(min_tail, memory_order_seq_cst);
+        log_min.store(min_tail, memory_order_release);
     }
 
     // delay 만큼 대기
@@ -202,25 +202,30 @@ private:
     {
         const auto start_idx = reserve_log(batch.size());
 
-        update_replica(replica, local_tail, start_idx, lg);
-
-        const unsigned one = 1;
-        unsigned zero = 0;
+        update_replica(replica, local_tail, start_idx, lg, false);
 
         for (auto i = 0; i < batch.size(); ++i)
         {
             if (start_idx + i == get_low_mark())
             {
-                while (!min_updater_ticket.compare_exchange_strong(zero, one))
+                while (true)
                 {
-                    zero = 0;
+                    if (0 == min_updater_ticket.fetch_add(1, memory_order_relaxed))
+                    {
+                        update_log_min();
+                        min_updater_ticket.store(0, memory_order_release);
+                        break;
+                    }
+
+                    while (min_updater_ticket.load(memory_order_acquire) > 0)
+                    {
+                        back_off(BACKOFF_DELAY);
+                    }
                 }
-                update_log_min();
-                min_updater_ticket.store(0);
             }
             else
             {
-                while (!min_updater_ticket.compare_exchange_strong(zero, zero))
+                while (min_updater_ticket.load(memory_order_acquire) > 0)
                 {
                     back_off(BACKOFF_DELAY);
                 }
@@ -234,33 +239,50 @@ private:
         }
 
         // local tail을 업데이트 한다.
-        local_tail.store(start_idx + batch.size(), memory_order_seq_cst);
+        local_tail.store(start_idx + batch.size(), memory_order_release);
         return start_idx;
     }
 
-    void update_replica(T &replica, atomic_uint64_t &local_tail, uint64_t to, const unique_lock<shared_mutex> &lg)
+    void update_replica(T &replica, atomic_uint64_t &local_tail, uint64_t to, const unique_lock<shared_mutex> &lg, bool is_read_only)
     {
         // 이 함수를 호출하기 전에 writer lock을 걸기 때문에 local tail과 replica를 마음껏 수정해도 된다.
         assert(lg && "the writer lock has not been acquired");
 
-        uint64_t l_tail = local_tail.load(memory_order_seq_cst);
-        while (l_tail < to)
+        uint64_t l_tail = local_tail.load(memory_order_acquire);
+        if (is_read_only)
         {
-            const auto idx = l_tail % log.size();
-            while (log[idx].is_empty)
+            while (l_tail < to)
             {
-                back_off(BACKOFF_DELAY);
-            }
-            replica.execute(log[idx].command, log[idx].args);
+                const auto idx = l_tail % log.size();
+                if (log[idx].is_empty)
+                {
+                    break;
+                }
+                replica.execute(log[idx].command, log[idx].args);
 
-            ++l_tail;
+                ++l_tail;
+            }
         }
-        local_tail.store(l_tail, memory_order_seq_cst);
+        else
+        {
+            while (l_tail < to)
+            {
+                const auto idx = l_tail % log.size();
+                while (log[idx].is_empty)
+                {
+                    back_off(BACKOFF_DELAY);
+                }
+                replica.execute(log[idx].command, log[idx].args);
+
+                ++l_tail;
+            }
+        }
+        local_tail.store(l_tail, memory_order_release);
     }
 
     void update_completed_tail(uint64_t last_index)
     {
-        auto local_c_tail = completed_tail.load(memory_order_seq_cst);
+        auto local_c_tail = completed_tail.load(memory_order_relaxed);
         while (last_index >= local_c_tail)
         {
             if (completed_tail.compare_exchange_strong(local_c_tail, last_index))
@@ -283,18 +305,18 @@ private:
 
     Res execute_read_only(const CMD &cmd, const ARGS &args)
     {
-        auto read_tail = completed_tail.load(memory_order_seq_cst);
+        auto read_tail = completed_tail.load(memory_order_relaxed);
         auto node_id = get_node_id();
         auto &rw_lock = *rw_locks[node_id];
         auto &local_tail = *local_tails[node_id];
         auto &replica = *replicas[node_id];
 
-        while (local_tail.load(memory_order_seq_cst) < read_tail)
+        while (local_tail.load(memory_order_acquire) < read_tail)
         {
             unique_lock<shared_mutex> lock{rw_lock, try_to_lock};
             if (lock)
             {
-                update_replica(replica, local_tail, read_tail, lock);
+                update_replica(replica, local_tail, read_tail, lock, true);
             }
             else
             {

@@ -93,9 +93,9 @@ void benchmark(uint num_thread, NR_HashTable *table)
 
 int main()
 {
-    for (uint num_thread = 2; num_thread <= 2; num_thread *= 2)
+    for (uint num_thread = 1; num_thread <= 32; num_thread *= 2)
     {
-        NR_HashTable nr_table{2, 1};
+        NR_HashTable nr_table{max(1u, num_thread / 8), min(num_thread, 8u)};
 
         vector<thread> worker;
         auto start_t = high_resolution_clock::now();
