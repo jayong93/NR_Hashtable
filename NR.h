@@ -83,7 +83,7 @@ public:
 
     void init_per_thread()
     {
-        thread_id = id_counter.fetch_add(1, memory_order_relaxed);
+        thread_id = id_counter.fetch_add(1, memory_order_seq_cst);
         // 각 thread를 id에 맞춰서 NUMA Node에 pinning
         if (-1 == numa_run_on_node(get_node_id()))
         {
@@ -98,7 +98,7 @@ public:
         unsigned max_node = 0;
         for (auto i = 0; i < node_num; ++i)
         {
-            auto node_tail = local_tails[i]->load(memory_order_acquire);
+            auto node_tail = local_tails[i]->load(memory_order_seq_cst);
             if (max_tail < node_tail)
             {
                 max_tail = node_tail;
@@ -131,13 +131,13 @@ private:
 
     uint64_t get_low_mark()
     {
-        return log_min.load(memory_order_acquire) - core_num_per_node;
+        return log_min.load(memory_order_seq_cst) - core_num_per_node;
     }
 
     unsigned int reserve_log(unsigned int size)
     {
         // CAS에서 실패한 경우 old_log_tail이 갱신되므로 여기서만 load하면 충분
-        auto old_log_tail = log_tail.load(memory_order_relaxed);
+        auto old_log_tail = log_tail.load(memory_order_seq_cst);
         while (true)
         {
             // size만큼 tail을 CAS로 전진, 만약 wrap around가 발생하면 계산해서 정확한 위치를 목표로 CAS
@@ -155,11 +155,11 @@ private:
         while (true)
         {
             auto min_tail = UINT64_MAX;
-            auto local_log_min = log_min.load(memory_order_relaxed);
+            auto local_log_min = log_min.load(memory_order_seq_cst);
 
             for (auto local_tail_ptr : local_tails)
             {
-                auto local_tail = local_tail_ptr->load(memory_order_acquire);
+                auto local_tail = local_tail_ptr->load(memory_order_seq_cst);
                 if (local_tail < min_tail)
                 {
                     min_tail = local_tail;
@@ -173,11 +173,11 @@ private:
 
             while (local_log_min < min_tail)
             {
-                log[local_log_min % log.size()].is_empty = true;
+                log[local_log_min % log.size()] = LogEntry<CMD, ARGS>{};
                 ++local_log_min;
             }
 
-            log_min.store(min_tail, memory_order_release);
+            log_min.store(min_tail, memory_order_seq_cst);
             return;
         }
     }
@@ -205,17 +205,18 @@ private:
         return batch;
     }
 
-    unsigned int update_log(const Batch &batch, T &replica, const unique_lock<shared_mutex> &lg)
+    unsigned int update_log(const Batch &batch, atomic_uint64_t& local_tail, T &replica, const unique_lock<shared_mutex> &lg)
     {
+        update_replica(replica, local_tail, completed_tail.load(memory_order_seq_cst), lg);
+
         const auto start_idx = reserve_log(batch.size());
 
-        auto node_id = get_node_id();
-        update_replica(replica, node_id, completed_tail.load(memory_order_acquire), lg);
+        update_replica(replica, local_tail, start_idx, lg);
 
         for (auto i = 0; i < batch.size(); ++i)
         {
             // log_min 갱신이 필요하다면 담당 thread가 update하기를 대기
-            while (start_idx + i >= log_min.load(memory_order_acquire))
+            while (start_idx + i >= log_min.load(memory_order_seq_cst))
             {
                 back_off(BACKOFF_DELAY);
             }
@@ -234,17 +235,16 @@ private:
         }
 
         // local tail을 업데이트 한다.
-        local_tails[node_id]->store(start_idx + batch.size(), memory_order_release);
+        local_tail.store(start_idx + batch.size(), memory_order_seq_cst);
         return start_idx;
     }
 
-    void update_replica(T &replica, unsigned node_id, uint64_t to, const unique_lock<shared_mutex> &lg)
+    void update_replica(T &replica, atomic_uint64_t& local_tail, uint64_t to, const unique_lock<shared_mutex> &lg)
     {
         // 이 함수를 호출하기 전에 writer lock을 걸기 때문에 local tail과 replica를 마음껏 수정해도 된다.
         assert(lg && "the writer lock has not been acquired");
-        auto &local_tail = *local_tails[node_id];
 
-        unsigned l_tail = local_tail.load(memory_order_relaxed);
+        uint64_t l_tail = local_tail.load(memory_order_seq_cst);
         while (l_tail < to)
         {
             const auto idx = l_tail % log.size();
@@ -256,18 +256,15 @@ private:
 
             ++l_tail;
         }
-        local_tail.store(l_tail, memory_order_release);
+        local_tail.store(l_tail, memory_order_seq_cst);
     }
 
     void update_completed_tail(uint64_t last_index)
     {
-        auto local_c_tail = completed_tail.load(memory_order_relaxed);
-        while (true)
+        auto local_c_tail = completed_tail.load(memory_order_seq_cst);
+        while (last_index >= local_c_tail)
         {
             if (completed_tail.compare_exchange_strong(local_c_tail, last_index))
-                break;
-
-            if (last_index < local_c_tail)
                 break;
         }
     }
@@ -287,18 +284,18 @@ private:
 
     Res execute_read_only(const CMD &cmd, const ARGS &args)
     {
-        auto read_tail = completed_tail.load(memory_order_relaxed);
+        auto read_tail = completed_tail.load(memory_order_seq_cst);
         auto node_id = get_node_id();
         auto &rw_lock = *rw_locks[node_id];
         auto &local_tail = *local_tails[node_id];
         auto &replica = *replicas[node_id];
 
-        while (local_tail.load(memory_order_acquire) < read_tail)
+        while (local_tail.load(memory_order_seq_cst) < read_tail)
         {
             unique_lock<shared_mutex> lock{rw_lock, try_to_lock};
             if (lock)
             {
-                update_replica(replica, node_id, read_tail, lock);
+                update_replica(replica, local_tail, read_tail, lock);
             }
             else
             {
@@ -317,16 +314,11 @@ private:
         auto &rw_lock = *rw_locks[node_id];
         auto &res = *response[thread_id];
         auto &replica = *replicas[node_id];
+        auto &local_tail = *local_tails[node_id];
 
         res.reset();
         op[thread_id]->emplace(cmd, args);
 
-        // 최대한 완료된 곳(completed tail)까지 local tail 및 replica를 갱신한다.
-        // 실행이 지연된 Node의 thread가 여기에서 local tail을 갱신해야 log_min을 갱신하는 thread가 진행 가능
-        // {
-        //     auto w_lock = unique_lock<shared_mutex>{rw_lock};
-        //     update_replica(replica, node_id, completed_tail.load(memory_order_acquire), w_lock);
-        // }
         // combiner lock 얻기를 시도한다.
         unique_lock<mutex> lock{combiner_lock, try_to_lock};
         while (true)
@@ -338,7 +330,7 @@ private:
                 auto batch = collect_batch();
                 // log entry를 등록된 op들 수 만큼 할당 받고 op들을 등록한다. 그리고 local replica를 update해서 local tail을 옮긴다
                 auto w_lock = unique_lock<shared_mutex>{rw_lock};
-                auto start_index = update_log(batch, replica, w_lock);
+                auto start_index = update_log(batch, local_tail, replica, w_lock);
                 // completed tail이 할당받은 마지막 entry index가 되도록 CAS를 시도한다.
                 update_completed_tail(start_index + batch.size());
                 // response에 결과들을 등록 한다.
