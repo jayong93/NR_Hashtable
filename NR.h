@@ -207,8 +207,6 @@ private:
 
     unsigned int update_log(const Batch &batch, atomic_uint64_t& local_tail, T &replica, const unique_lock<shared_mutex> &lg)
     {
-        update_replica(replica, local_tail, completed_tail.load(memory_order_seq_cst), lg);
-
         const auto start_idx = reserve_log(batch.size());
 
         update_replica(replica, local_tail, start_idx, lg);
