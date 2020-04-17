@@ -152,34 +152,27 @@ private:
 
     void update_log_min()
     {
-        while (true)
+        auto min_tail = UINT64_MAX;
+        auto local_log_min = log_min.load(memory_order_seq_cst);
+
+        for (auto local_tail_ptr : local_tails)
         {
-            auto min_tail = UINT64_MAX;
-            auto local_log_min = log_min.load(memory_order_seq_cst);
-
-            for (auto local_tail_ptr : local_tails)
+            auto local_tail = local_tail_ptr->load(memory_order_seq_cst);
+            if (local_tail < min_tail)
             {
-                auto local_tail = local_tail_ptr->load(memory_order_seq_cst);
-                if (local_tail < min_tail)
-                {
-                    min_tail = local_tail;
-                }
+                min_tail = local_tail;
             }
-
-            if (local_log_min % log.size() == min_tail % log.size())
-                continue;
-
-            min_tail += log.size();
-
-            while (local_log_min < min_tail)
-            {
-                log[local_log_min % log.size()] = LogEntry<CMD, ARGS>{};
-                ++local_log_min;
-            }
-
-            log_min.store(min_tail, memory_order_seq_cst);
-            return;
         }
+
+        min_tail += log.size();
+
+        while (local_log_min < min_tail)
+        {
+            log[local_log_min % log.size()] = LogEntry<CMD, ARGS>{};
+            ++local_log_min;
+        }
+
+        log_min.store(min_tail, memory_order_seq_cst);
     }
 
     // delay 만큼 대기
@@ -205,18 +198,32 @@ private:
         return batch;
     }
 
-    unsigned int update_log(const Batch &batch, atomic_uint64_t& local_tail, T &replica, const unique_lock<shared_mutex> &lg)
+    unsigned int update_log(const Batch &batch, atomic_uint64_t &local_tail, T &replica, const unique_lock<shared_mutex> &lg)
     {
         const auto start_idx = reserve_log(batch.size());
 
         update_replica(replica, local_tail, start_idx, lg);
 
+        const unsigned one = 1;
+        unsigned zero = 0;
+
         for (auto i = 0; i < batch.size(); ++i)
         {
-            // log_min 갱신이 필요하다면 담당 thread가 update하기를 대기
-            while (start_idx + i >= log_min.load(memory_order_seq_cst))
+            if (start_idx + i == get_low_mark())
             {
-                back_off(BACKOFF_DELAY);
+                while (!min_updater_ticket.compare_exchange_strong(zero, one))
+                {
+                    zero = 0;
+                }
+                update_log_min();
+                min_updater_ticket.store(0);
+            }
+            else
+            {
+                while (!min_updater_ticket.compare_exchange_strong(zero, zero))
+                {
+                    back_off(BACKOFF_DELAY);
+                }
             }
 
             const auto &[_, cmd, args] = batch[i];
@@ -224,12 +231,6 @@ private:
             entry.command = cmd;
             entry.args = args;
             entry.is_empty = false;
-
-            // 내가 log_min 갱신 담당이라면 update
-            if (start_idx + i == get_low_mark())
-            {
-                update_log_min();
-            }
         }
 
         // local tail을 업데이트 한다.
@@ -237,7 +238,7 @@ private:
         return start_idx;
     }
 
-    void update_replica(T &replica, atomic_uint64_t& local_tail, uint64_t to, const unique_lock<shared_mutex> &lg)
+    void update_replica(T &replica, atomic_uint64_t &local_tail, uint64_t to, const unique_lock<shared_mutex> &lg)
     {
         // 이 함수를 호출하기 전에 writer lock을 걸기 때문에 local tail과 replica를 마음껏 수정해도 된다.
         assert(lg && "the writer lock has not been acquired");
