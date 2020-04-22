@@ -84,14 +84,14 @@ void benchmark(uint num_thread, NR_HashTable *table)
             printf("Unknown Command!\n");
             exit(-1);
         }
-#ifndef NDEBUG
+#ifdef DEBUG
         if (i % 500 == 0)
             printf("Thread #%d run operation #%d\n", thread_id, i);
 #endif
     }
 }
 
-int main()
+int main(int argc, char* argv[])
 {
     for (uint num_thread = 1; num_thread <= 32; num_thread *= 2)
     {
