@@ -42,7 +42,10 @@ class NR
     using Batch = vector<tuple<unsigned, CMD, ARGS>>;
 
 public:
-    NR<T, CMD, ARGS, Res>(unsigned node_num, unsigned core_num_per_node) : node_num{node_num}, core_num_per_node{core_num_per_node}, log{LOG_SIZE}, log_min{LOG_SIZE}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
+    NR<T, CMD, ARGS, Res>() : NR<T, CMD, ARGS, Res>{(unsigned)numa_num_configured_cpus()}
+    {
+    }
+    NR<T, CMD, ARGS, Res>(unsigned num_cores) : node_num{(unsigned)numa_num_configured_nodes()}, core_num_per_node{num_cores / node_num}, log{LOG_SIZE}, log_min{LOG_SIZE}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
     {
         for (auto i = 0; i < node_num; ++i)
         {
@@ -87,7 +90,7 @@ public:
         // 각 thread를 id에 맞춰서 NUMA Node에 pinning
         if (-1 == numa_run_on_node(get_node_id()))
         {
-            fprintf(stderr, "Can't bind thread #%d to node #%d", thread_id, get_node_id());
+            fprintf(stderr, "Can't bind thread #%d to node #%d\n", thread_id, get_node_id());
             exit(-1);
         }
     }
@@ -300,7 +303,7 @@ private:
 
     unsigned int get_node_id() const
     {
-        return thread_id / core_num_per_node;
+        return (thread_id / core_num_per_node) % node_num;
     }
 
     Res execute_read_only(const CMD &cmd, const ARGS &args)

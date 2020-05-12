@@ -91,11 +91,12 @@ void benchmark(uint num_thread, NR_HashTable *table)
     }
 }
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
+    printf("[INFO] node_num = %d, cpu num = %d\n", numa_num_configured_nodes(), numa_num_configured_cpus());
     for (uint num_thread = 1; num_thread <= 32; num_thread *= 2)
     {
-        NR_HashTable nr_table{max(1u, num_thread / 8), min(num_thread, 8u)};
+        NR_HashTable nr_table{num_thread};
 
         vector<thread> worker;
         auto start_t = high_resolution_clock::now();
