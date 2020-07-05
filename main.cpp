@@ -5,6 +5,10 @@
 #include <thread>
 #include "NR.h"
 
+#ifndef WRITE_RATIO
+#define WRITE_RATIO 30
+#endif
+
 using namespace std;
 using namespace chrono;
 
@@ -68,21 +72,28 @@ void benchmark(uint num_thread, NR_HashTable *table)
     table->init_per_thread();
     for (int i = 0; i < NUM_TEST / num_thread; ++i)
     {
-        //	if (0 == i % 100000) cout << ".";
-        switch (fastrand() % 3)
-        {
-        case 0:
-            table->execute(HashTable::CMD::Insert, make_pair(fastrand() % RANGE, fastrand()));
-            break;
-        case 1:
-            table->execute(HashTable::CMD::Remove, make_pair(fastrand() % RANGE, 0));
-            break;
-        case 2:
-            table->execute(HashTable::CMD::Contains, make_pair(fastrand() % RANGE, 0));
-            break;
-        default:
-            printf("Unknown Command!\n");
-            exit(-1);
+        if (fastrand() % 100 < WRITE_RATIO) {
+            if (fastrand() % 100 < 50) {
+#ifdef RANGE_LIMIT
+                table->execute(HashTable::CMD::Insert, make_pair(fastrand() % RANGE, fastrand()));
+#else
+                table->execute(HashTable::CMD::Insert, make_pair(fastrand(), fastrand()));
+#endif
+            }
+            else {
+#ifdef RANGE_LIMIT
+                table->execute(HashTable::CMD::Remove, make_pair(fastrand() % RANGE, 0));
+#else
+                table->execute(HashTable::CMD::Remove, make_pair(fastrand(), 0));
+#endif
+            }
+        }
+        else {
+#ifdef RANGE_LIMIT
+                table->execute(HashTable::CMD::Contains, make_pair(fastrand() % RANGE, 0));
+#else
+                table->execute(HashTable::CMD::Contains, make_pair(fastrand(), 0));
+#endif
         }
 #ifdef DEBUG
         if (i % 500 == 0)
