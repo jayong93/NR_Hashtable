@@ -3,7 +3,9 @@
 #include <variant>
 #include <chrono>
 #include <thread>
+#include <random>
 #include "NR.h"
+#include "rand_seeds.h"
 
 #ifndef WRITE_RATIO
 #define WRITE_RATIO 30
@@ -11,22 +13,6 @@
 
 using namespace std;
 using namespace chrono;
-
-unsigned long fastrand(void)
-{ //period 2^96-1
-    static thread_local unsigned long x = 123456789, y = 362436069, z = 521288629;
-    unsigned long t;
-    x ^= x << 16;
-    x ^= x >> 5;
-    x ^= x << 1;
-
-    t = x;
-    x = y;
-    y = z;
-    z = t ^ x ^ y;
-
-    return z;
-}
 
 struct HashTable
 {
@@ -69,31 +55,27 @@ using NR_HashTable = NR<HashTable, HashTable::CMD, HashTable::ARGS, HashTable::R
 
 void benchmark(uint num_thread, NR_HashTable *table)
 {
+    mt19937_64 rng{rand_seeds[thread_id]};
+#ifdef RANGE_LIMIT
+    uniform_int_distribution<unsigned long> dist{0, RANGE-1};
+#else
+    uniform_int_distribution<unsigned long> dist;
+#endif
+    uniform_int_distribution<unsigned long> cmd_dist{0, 99};
+
     table->init_per_thread();
     for (int i = 0; i < NUM_TEST / num_thread; ++i)
     {
-        if (fastrand() % 100 < WRITE_RATIO) {
-            if (fastrand() % 100 < 50) {
-#ifdef RANGE_LIMIT
-                table->execute(HashTable::CMD::Insert, make_pair(fastrand() % RANGE, fastrand()));
-#else
-                table->execute(HashTable::CMD::Insert, make_pair(fastrand(), fastrand()));
-#endif
+        if (cmd_dist(rng) < WRITE_RATIO) {
+            if (cmd_dist(rng) < 50) {
+                table->execute(HashTable::CMD::Insert, make_pair(dist(rng), dist(rng)));
             }
             else {
-#ifdef RANGE_LIMIT
-                table->execute(HashTable::CMD::Remove, make_pair(fastrand() % RANGE, 0));
-#else
-                table->execute(HashTable::CMD::Remove, make_pair(fastrand(), 0));
-#endif
+                table->execute(HashTable::CMD::Remove, make_pair(dist(rng), 0));
             }
         }
         else {
-#ifdef RANGE_LIMIT
-                table->execute(HashTable::CMD::Contains, make_pair(fastrand() % RANGE, 0));
-#else
-                table->execute(HashTable::CMD::Contains, make_pair(fastrand(), 0));
-#endif
+                table->execute(HashTable::CMD::Contains, make_pair(dist(rng), 0));
         }
 #ifdef DEBUG
         if (i % 500 == 0)

@@ -45,7 +45,7 @@ public:
     NR<T, CMD, ARGS, Res>() : NR<T, CMD, ARGS, Res>{(unsigned)numa_num_configured_cpus()}
     {
     }
-    NR<T, CMD, ARGS, Res>(unsigned num_cores) : node_num{(unsigned)numa_num_configured_nodes()}, core_num_per_node{std::max((unsigned)(num_cores / node_num), 1u)}, log{LOG_SIZE}, log_min{LOG_SIZE}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
+    NR<T, CMD, ARGS, Res>(unsigned num_cores) : node_num{max((unsigned)numa_num_configured_nodes(), 1u)}, core_num_per_node{std::max((unsigned)(num_cores / node_num), 1u)}, log{LOG_SIZE}, log_min{LOG_SIZE}, log_tail{0}, completed_tail{0}, max_batch{core_num_per_node}
     {
         for (auto i = 0; i < node_num; ++i)
         {
